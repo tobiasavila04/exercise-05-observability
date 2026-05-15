@@ -1,14 +1,34 @@
 from datetime import datetime, timezone
+ 
 from fastapi import Depends, FastAPI, HTTPException, Response
+from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+ 
 from src.database import Base, engine, get_db
 from src.models import Node
 from src.schemas import NodeCreate, NodeResponse, NodeUpdate
-
+ 
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
-
+ 
+nodes_registered_total = Counter(
+    "nodes_registered_total", "Total number of nodes registered"
+)
+nodes_deleted_total = Counter(
+    "nodes_deleted_total", "Total number of nodes soft-deleted"
+)
+active_nodes_gauge = Gauge(
+    "active_nodes", "Current number of active nodes"
+)
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds", "HTTP request duration", ["method", "endpoint"]
+)
+ 
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+ 
+ 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
@@ -17,8 +37,10 @@ def health(db: Session = Depends(get_db)):
     except Exception:
         db_status = "disconnected"
     count = db.query(Node).filter(Node.status == "active").count()
+    active_nodes_gauge.set(count)
     return {"status": "ok", "db": db_status, "nodes_count": count}
-
+ 
+ 
 @app.post("/api/nodes", response_model=NodeResponse, status_code=201)
 def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     existing = db.query(Node).filter(Node.name == node.name).first()
@@ -28,19 +50,24 @@ def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     db.add(db_node)
     db.commit()
     db.refresh(db_node)
+    nodes_registered_total.inc()
+    active_nodes_gauge.inc()
     return db_node
-
+ 
+ 
 @app.get("/api/nodes", response_model=list[NodeResponse])
 def list_nodes(db: Session = Depends(get_db)):
     return db.query(Node).all()
-
+ 
+ 
 @app.get("/api/nodes/{name}", response_model=NodeResponse)
 def get_node(name: str, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.name == name).first()
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     return node
-
+ 
+ 
 @app.put("/api/nodes/{name}", response_model=NodeResponse)
 def update_node(name: str, update: NodeUpdate, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.name == name).first()
@@ -54,7 +81,8 @@ def update_node(name: str, update: NodeUpdate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(node)
     return node
-
+ 
+ 
 @app.delete("/api/nodes/{name}", status_code=204)
 def delete_node(name: str, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.name == name).first()
@@ -63,4 +91,6 @@ def delete_node(name: str, db: Session = Depends(get_db)):
     node.status = "inactive"
     node.updated_at = datetime.now(timezone.utc)
     db.commit()
+    nodes_deleted_total.inc()
+    active_nodes_gauge.dec()
     return Response(status_code=204)
