@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
  
 from fastapi import Depends, FastAPI, HTTPException, Response
-from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
+from fastapi.responses import PlainTextResponse
+from prometheus_client import (
+    Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+)
 from sqlalchemy import text
 from sqlalchemy.orm import Session
  
@@ -18,15 +21,23 @@ nodes_registered_total = Counter(
 nodes_deleted_total = Counter(
     "nodes_deleted_total", "Total number of nodes soft-deleted"
 )
-active_nodes_gauge = Gauge(
+active_nodes = Gauge(
     "active_nodes", "Current number of active nodes"
 )
 http_request_duration_seconds = Histogram(
     "http_request_duration_seconds", "HTTP request duration", ["method", "endpoint"]
 )
+http_requests_total = Counter(
+    "http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"]
+)
  
-metrics_app = make_asgi_app()
-app.mount("/metrics", metrics_app)
+ 
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
  
  
 @app.get("/health")
@@ -37,7 +48,7 @@ def health(db: Session = Depends(get_db)):
     except Exception:
         db_status = "disconnected"
     count = db.query(Node).filter(Node.status == "active").count()
-    active_nodes_gauge.set(count)
+    active_nodes.set(count)
     return {"status": "ok", "db": db_status, "nodes_count": count}
  
  
@@ -51,7 +62,8 @@ def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_node)
     nodes_registered_total.inc()
-    active_nodes_gauge.inc()
+    active_nodes.inc()
+    http_requests_total.labels(method="POST", endpoint="/api/nodes", status="201").inc()
     return db_node
  
  
@@ -92,5 +104,6 @@ def delete_node(name: str, db: Session = Depends(get_db)):
     node.updated_at = datetime.now(timezone.utc)
     db.commit()
     nodes_deleted_total.inc()
-    active_nodes_gauge.dec()
+    active_nodes.dec()
+    http_requests_total.labels(method="DELETE", endpoint="/api/nodes/{name}", status="204").inc()
     return Response(status_code=204)
